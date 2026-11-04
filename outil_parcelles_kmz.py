@@ -123,7 +123,14 @@ def fetch_parcels(impact,url,typename,page_size=5000):
         params={"service":"WFS","version":"2.0.0","request":"GetFeature","typeNames":typename,
                 "srsName":"EPSG:4326","bbox":bbox,"count":page_size,"startIndex":start,
                 "outputFormat":"application/json"}
-        r=requests.get(url,params=params,timeout=180); r.raise_for_status()
+        r = requests.get(url, params=params, timeout=180)
+
+        if not r.ok:
+            raise RuntimeError(
+                      f"Erreur WFS HTTP {r.status_code}\n\n"
+                      f"URL appelée :\n{r.url}\n\n"
+                      f"Réponse du SPF Finances :\n{r.text[:3000]}"
+                  )
         try: page=read_response(r.content,r.headers.get("content-type",""))
         except Exception as exc: raise RuntimeError("Reponse WFS illisible: "+r.text[:400]) from exc
         if page.empty: break
