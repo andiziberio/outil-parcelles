@@ -18,7 +18,7 @@ from shapely.geometry import LineString, Point, Polygon
 
 WFS_URL = "https://ccff02.minfin.fgov.be/geoservices/arcgis/rest/services/INSPIRE/CP/MapServer/exts/InspireFeatureDownload/service"
 DEFAULT_TYPENAME = "CP:CadastralParcel"
-WORK_CRS = "EPSG:31370"
+WORK_CRS = "EPSG:3812"  # Belgian Lambert 2008, projection native annoncee
 NS = {"k": "http://www.opengis.net/kml/2.2"}
 
 
@@ -114,33 +114,59 @@ def read_response(content,content_type):
         return gpd.read_file(path)
 
 
-def fetch_parcels(impact,url,typename,page_size=5000):
-    minx,miny,maxx,maxy=impact.to_crs("EPSG:4326").total_bounds
-    # WFS 2.0 with EPSG:4326 uses latitude,longitude axis order.
-    bbox=f"{miny},{minx},{maxy},{maxx},urn:ogc:def:crs:EPSG::4326"
-    pages=[]; start=0
-    while True:
-        params={"service":"WFS","version":"2.0.0","request":"GetFeature","typeNames":typename,
-                "srsName":"EPSG:4326","bbox":bbox,"count":page_size,"startIndex":start,
-                "outputFormat":"application/json"}
-        r = requests.get(url, params=params, timeout=180)
-
-        if not r.ok:
-            raise RuntimeError(
-                      f"Erreur WFS HTTP {r.status_code}\n\n"
-                      f"URL appelée :\n{r.url}\n\n"
-                      f"Réponse du SPF Finances :\n{r.text[:3000]}"
-                  )
-        try: page=read_response(r.content,r.headers.get("content-type",""))
-        except Exception as exc: raise RuntimeError("Reponse WFS illisible: "+r.text[:400]) from exc
-        if page.empty: break
-        pages.append(page)
-        if len(page)<page_size: break
-        start+=page_size
-        if start>200000: raise RuntimeError("Emprise trop grande: plus de 200 000 objets.")
-    if not pages: raise RuntimeError("Aucune parcelle renvoyee par le WFS.")
+def fetch_parcels(impact,url,typename,page_size=1000,max_retries=4):
+    """Interroge le WFS en EPSG:3812/GML avec pagination et reprise sur 502/503/504."""
+    import time
+    bounds=impact.to_crs(WORK_CRS).total_bounds
+    minx,miny,maxx,maxy=map(float,bounds)
+    # Decoupage de l'emprise pour eviter les requetes trop lourdes et les 502.
+    max_tile=5000.0
+    nx=max(1,int((maxx-minx)//max_tile)+1); ny=max(1,int((maxy-miny)//max_tile)+1)
+    xs=[minx+(maxx-minx)*i/nx for i in range(nx+1)]
+    ys=[miny+(maxy-miny)*i/ny for i in range(ny+1)]
+    pages=[]
+    session=requests.Session()
+    session.headers.update({"User-Agent":"outil-parcelles-kmz/2.0","Accept":"application/gml+xml, text/xml, application/xml"})
+    for ix in range(nx):
+      for iy in range(ny):
+        bbox=f"{xs[ix]},{ys[iy]},{xs[ix+1]},{ys[iy+1]},EPSG:3812"
+        start=0
+        while True:
+            params={"service":"WFS","version":"2.0.0","request":"GetFeature","typeNames":typename,
+                    "srsName":"EPSG:3812","bbox":bbox,"count":page_size,"startIndex":start,
+                    "outputFormat":"GML32"}
+            response=None
+            for attempt in range(max_retries):
+                try:
+                    response=session.get(url,params=params,timeout=(20,240),allow_redirects=True)
+                    if response.status_code not in (502,503,504): break
+                except requests.RequestException:
+                    if attempt==max_retries-1: raise
+                time.sleep(2**attempt)
+            if response is None: raise RuntimeError("Aucune reponse du WFS.")
+            if response.status_code in (502,503,504):
+                raise RuntimeError(f"WFS SPF Finances indisponible apres {max_retries} essais (HTTP {response.status_code}). "
+                                   "Reessayez plus tard ou executez l'application localement; le serveur peut filtrer Streamlit Cloud.")
+            if not response.ok:
+                raise RuntimeError(f"Erreur WFS HTTP {response.status_code}\nURL: {response.url}\n{response.text[:1500]}")
+            text=response.text.lstrip().lower()
+            if "exceptionreport" in text or "serviceexception" in text:
+                raise RuntimeError("Erreur retournee par le WFS:\n"+response.text[:2000])
+            try: page=read_response(response.content,response.headers.get("content-type","application/gml+xml"))
+            except Exception as exc: raise RuntimeError("Reponse GML WFS illisible: "+response.text[:800]) from exc
+            if page.empty: break
+            pages.append(page)
+            if len(page)<page_size: break
+            start+=page_size
+            if start>100000: raise RuntimeError("Plus de 100 000 parcelles dans une tuile; reduisez l'emprise.")
+    if not pages: raise RuntimeError("Aucune parcelle renvoyee par le WFS pour cette emprise.")
     result=gpd.GeoDataFrame(pd.concat(pages,ignore_index=True),crs=pages[0].crs)
-    return result[result.geometry.notna() & ~result.geometry.is_empty].to_crs(WORK_CRS)
+    result=result[result.geometry.notna() & ~result.geometry.is_empty].copy()
+    # Retirer les doublons crees aux limites des tuiles.
+    idcol=find_column(result.columns,["nationalCadastralReference","capakey","parcelKey","localId"])
+    if idcol: result=result.drop_duplicates(subset=[idcol])
+    else: result=result.loc[~result.geometry.to_wkb().duplicated()].copy()
+    return result.to_crs(WORK_CRS)
 
 
 def find_column(columns,candidates):
@@ -197,8 +223,8 @@ def run(uploaded,access_width,overhead_width,point_radius,url,typename,include_o
 
 
 st.set_page_config(page_title="Parcelles permis KMZ",layout="wide")
-st.title("Parcelles cadastrales pour permis de ligne aerienne")
-st.write("Chargez un KMZ, interrogez le parcellaire cadastral et exportez les intersections dans Excel.")
+st.title("Parcelles cadastrales pour permis de ligne aerienne - V2")
+st.write("V2: requetes WFS en EPSG:3812/GML, decoupage de l emprise et reprises automatiques sur les erreurs 502/503/504.")
 uploaded=st.file_uploader("Fichier KMZ",type=["kmz"])
 c1,c2,c3=st.columns(3)
 access_width=c1.number_input("Largeur totale des acces (m)",0.0,100.0,5.0,0.5)
