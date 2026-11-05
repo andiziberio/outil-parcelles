@@ -1,251 +1,160 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Application Streamlit: KMZ -> parcelles cadastrales belges -> Excel.
-Installation:
-  pip install streamlit geopandas shapely pyproj requests pandas openpyxl pyogrio
-Lancement:
-  streamlit run outil_parcelles_kmz.py
-"""
-from __future__ import annotations
+"""Option A: Streamlit KMZ + fichier cadastral local -> Excel, sans WFS."""
 import io, re, tempfile, zipfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import geopandas as gpd
 import pandas as pd
-import requests
 import streamlit as st
 from shapely.geometry import LineString, Point, Polygon
 
-WFS_URL = "https://ccff02.minfin.fgov.be/geoservices/arcgis/rest/services/INSPIRE/CP/MapServer/exts/InspireFeatureDownload/service"
-DEFAULT_TYPENAME = "CP:CadastralParcel"
-WORK_CRS = "EPSG:3812"  # Belgian Lambert 2008, projection native annoncee
-NS = {"k": "http://www.opengis.net/kml/2.2"}
+WORK_CRS='EPSG:3812'
+NS={'k':'http://www.opengis.net/kml/2.2'}
 
-
-def parse_coordinates(text):
-    result=[]
-    for token in (text or "").strip().split():
-        values=token.split(",")
-        if len(values)>=2:
-            try: result.append((float(values[0]),float(values[1])))
+def coords(text):
+    out=[]
+    for token in (text or '').strip().split():
+        p=token.split(',')
+        if len(p)>=2:
+            try: out.append((float(p[0]),float(p[1])))
             except ValueError: pass
-    return result
+    return out
 
-
-def read_kmz(uploaded):
-    data=uploaded.getvalue() if hasattr(uploaded,"getvalue") else Path(uploaded).read_bytes()
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        names=[x for x in archive.namelist() if x.lower().endswith(".kml")]
-        if not names: raise ValueError("Aucun fichier KML trouve dans le KMZ.")
-        root=ET.fromstring(archive.read(names[0]))
-    parent={child:node for node in root.iter() for child in node}
+def read_kmz(upload):
+    raw=upload.getvalue()
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        names=[n for n in z.namelist() if n.lower().endswith('.kml')]
+        if not names: raise ValueError('Aucun KML dans le KMZ.')
+        root=ET.fromstring(z.read(names[0]))
+    parent={c:n for n in root.iter() for c in n}
     rows=[]
-    for pm in root.findall(".//k:Placemark",NS):
-        name=(pm.findtext("k:name",default="",namespaces=NS) or "").strip()
-        folders=[]; node=pm
-        while node in parent:
-            node=parent[node]
-            if node.tag.endswith("Folder"):
-                folder=(node.findtext("k:name",default="",namespaces=NS) or "").strip()
-                if folder: folders.append(folder)
-        folder=" / ".join(reversed(folders))
-        label=name or folder or "Sans nom"
-        for item in pm.findall(".//k:Point",NS):
-            c=parse_coordinates(item.findtext("k:coordinates",default="",namespaces=NS))
+    for pm in root.findall('.//k:Placemark',NS):
+        name=(pm.findtext('k:name',default='',namespaces=NS) or '').strip()
+        folders=[]; n=pm
+        while n in parent:
+            n=parent[n]
+            if n.tag.endswith('Folder'):
+                f=(n.findtext('k:name',default='',namespaces=NS) or '').strip()
+                if f: folders.append(f)
+        folder=' / '.join(reversed(folders)); label=name or folder or 'Sans nom'
+        for x in pm.findall('.//k:Point',NS):
+            c=coords(x.findtext('k:coordinates',default='',namespaces=NS))
             if c: rows.append((label,folder,Point(c[0])))
-        for item in pm.findall(".//k:LineString",NS):
-            c=parse_coordinates(item.findtext("k:coordinates",default="",namespaces=NS))
+        for x in pm.findall('.//k:LineString',NS):
+            c=coords(x.findtext('k:coordinates',default='',namespaces=NS))
             if len(c)>=2: rows.append((label,folder,LineString(c)))
-        for item in pm.findall(".//k:Polygon",NS):
-            outer=item.findtext(".//k:outerBoundaryIs/k:LinearRing/k:coordinates",default="",namespaces=NS)
-            shell=parse_coordinates(outer); holes=[]
-            for inner in item.findall(".//k:innerBoundaryIs/k:LinearRing/k:coordinates",NS):
-                ring=parse_coordinates(inner.text)
-                if len(ring)>=4: holes.append(ring)
-            if len(shell)>=4:
-                geom=Polygon(shell,holes)
-                if not geom.is_valid: geom=geom.buffer(0)
-                if not geom.is_empty: rows.append((label,folder,geom))
-    if not rows: raise ValueError("Aucune geometrie exploitable dans le KMZ.")
-    return gpd.GeoDataFrame({"ELEMENT_KMZ":[r[0] for r in rows],"DOSSIER_KMZ":[r[1] for r in rows]},geometry=[r[2] for r in rows],crs="EPSG:4326")
+        for x in pm.findall('.//k:Polygon',NS):
+            c=coords(x.findtext('.//k:outerBoundaryIs/k:LinearRing/k:coordinates',default='',namespaces=NS))
+            if len(c)>=4:
+                g=Polygon(c)
+                if not g.is_valid:g=g.buffer(0)
+                if not g.is_empty: rows.append((label,folder,g))
+    if not rows: raise ValueError('Aucune geometrie exploitable dans le KMZ.')
+    return gpd.GeoDataFrame({'ELEMENT_KMZ':[r[0] for r in rows],'DOSSIER_KMZ':[r[1] for r in rows]},geometry=[r[2] for r in rows],crs='EPSG:4326')
 
+def classify(name,folder,typ):
+    s=f'{folder} {name}'.casefold()
+    if re.search(r'acc[eè]s|access|chemin|route|track|tole',s): return 'ACCES'
+    if re.search(r'tireuse|freineuse|tirage|freinage',s): return 'TIREUSE_FREINEUSE'
+    if re.search(r'zone.*travaux|travaux|work.?zone|plateforme|stockage',s): return 'ZONE_TRAVAUX'
+    if re.search(r'surplomb|overhead|ligne|line|port[eé]e|span',s): return 'SURPLOMB'
+    return 'SURPLOMB' if 'LineString' in typ else 'AUTRE'
 
-def classify(name,folder,geom_type):
-    value=f"{folder} {name}".casefold()
-    if re.search(r"acc[eè]s|access|chemin|route|track|tole",value): return "ACCES"
-    if re.search(r"tireuse|freineuse|tirage|freinage",value): return "TIREUSE_FREINEUSE"
-    if re.search(r"zone.*travaux|travaux|work.?zone|plateforme|stockage",value): return "ZONE_TRAVAUX"
-    if re.search(r"surplomb|overhead|ligne|line|port[eé]e|span",value): return "SURPLOMB"
-    return "SURPLOMB" if geom_type in ("LineString","MultiLineString") else "AUTRE"
+def prepare(raw,access_width,overhead_width,point_radius,include_other):
+    g=raw.to_crs(WORK_CRS).copy()
+    g['TYPE_IMPACT']=[classify(n,f,t) for n,f,t in zip(g.ELEMENT_KMZ,g.DOSSIER_KMZ,g.geom_type)]
+    if not include_other:g=g[g.TYPE_IMPACT!='AUTRE'].copy()
+    if g.empty:raise ValueError('Aucun objet utile reconnu dans le KMZ.')
+    new=[]
+    for _,r in g.iterrows():
+        x=r.geometry
+        if x.geom_type in ('Point','MultiPoint'):x=x.buffer(point_radius)
+        elif x.geom_type in ('LineString','MultiLineString'):
+            w=access_width if r.TYPE_IMPACT=='ACCES' else overhead_width
+            if w>0:x=x.buffer(w/2,cap_style=2,join_style=2)
+        if not x.is_valid:x=x.buffer(0)
+        new.append(x)
+    g.geometry=new
+    return g[~g.geometry.is_empty].copy()
 
+def read_cadastre(upload):
+    name=upload.name.lower(); raw=upload.getvalue()
+    with tempfile.TemporaryDirectory() as td:
+        root=Path(td)
+        if name.endswith('.zip'):
+            zpath=root/'cadastre.zip';zpath.write_bytes(raw)
+            with zipfile.ZipFile(zpath) as z:z.extractall(root/'unzipped')
+            candidates=[p for p in (root/'unzipped').rglob('*') if p.suffix.lower() in ('.gpkg','.gml','.shp','.geojson','.json')]
+            if not candidates:raise ValueError('ZIP: aucun GPKG, GML, SHP ou GeoJSON trouve.')
+            path=next((p for p in candidates if p.suffix.lower()=='.gpkg'),candidates[0])
+        else:
+            suffix=Path(upload.name).suffix or '.gml';path=root/('cadastre'+suffix);path.write_bytes(raw)
+        try:g=gpd.read_file(path)
+        except Exception as e:raise RuntimeError(f'Impossible de lire le fichier cadastral {upload.name}: {e}') from e
+    if g.empty:raise ValueError('Le fichier cadastral est vide.')
+    if g.crs is None:raise ValueError('Le fichier cadastral ne contient pas de CRS/projection.')
+    g=g[g.geometry.notna() & ~g.geometry.is_empty].copy()
+    return g.to_crs(WORK_CRS)
 
-def prepare_impact(raw,access_width,overhead_width,point_radius,include_other):
-    gdf=raw.to_crs(WORK_CRS).copy()
-    gdf["TYPE_IMPACT"]=[classify(n,f,t) for n,f,t in zip(gdf.ELEMENT_KMZ,gdf.DOSSIER_KMZ,gdf.geom_type)]
-    if not include_other: gdf=gdf[gdf.TYPE_IMPACT!="AUTRE"].copy()
-    if gdf.empty: raise ValueError("Aucun objet utile reconnu. Activez 'Inclure les objets non classes'.")
-    geometries=[]
-    for _,row in gdf.iterrows():
-        geom=row.geometry
-        if geom.geom_type in ("Point","MultiPoint"): geom=geom.buffer(point_radius)
-        elif geom.geom_type in ("LineString","MultiLineString"):
-            half=(access_width if row.TYPE_IMPACT=="ACCES" else overhead_width)/2
-            if half>0: geom=geom.buffer(half,cap_style=2,join_style=2)
-        if not geom.is_valid: geom=geom.buffer(0)
-        geometries.append(geom)
-    gdf.geometry=geometries
-    return gdf[~gdf.geometry.is_empty].copy()
-
-
-def feature_types(url):
-    r=requests.get(url,params={"service":"WFS","request":"GetCapabilities","version":"2.0.0"},timeout=90)
-    r.raise_for_status(); root=ET.fromstring(r.content); names=[]
-    for ft in root.iter():
-        if ft.tag.endswith("FeatureType"):
-            name=next((x.text.strip() for x in list(ft) if x.tag.endswith("Name") and x.text),None)
-            if name: names.append(name)
-    return names
-
-
-def read_response(content,content_type):
-    suffix=".geojson" if "json" in content_type.lower() else ".gml"
-    with tempfile.TemporaryDirectory() as tmp:
-        path=Path(tmp)/("response"+suffix); path.write_bytes(content)
-        return gpd.read_file(path)
-
-
-def fetch_parcels(impact,url,typename,page_size=1000,max_retries=4):
-    """Interroge le WFS en EPSG:3812/GML avec pagination et reprise sur 502/503/504."""
-    import time
-    bounds=impact.to_crs(WORK_CRS).total_bounds
-    minx,miny,maxx,maxy=map(float,bounds)
-    # Decoupage de l'emprise pour eviter les requetes trop lourdes et les 502.
-    max_tile=5000.0
-    nx=max(1,int((maxx-minx)//max_tile)+1); ny=max(1,int((maxy-miny)//max_tile)+1)
-    xs=[minx+(maxx-minx)*i/nx for i in range(nx+1)]
-    ys=[miny+(maxy-miny)*i/ny for i in range(ny+1)]
-    pages=[]
-    session=requests.Session()
-    session.headers.update({"User-Agent":"outil-parcelles-kmz/2.0","Accept":"application/gml+xml, text/xml, application/xml"})
-    for ix in range(nx):
-      for iy in range(ny):
-        bbox=f"{xs[ix]},{ys[iy]},{xs[ix+1]},{ys[iy+1]},EPSG:3812"
-        start=0
-        while True:
-            params={"service":"WFS","version":"2.0.0","request":"GetFeature","typeNames":typename,
-                    "srsName":"EPSG:3812","bbox":bbox,"count":page_size,"startIndex":start,
-                    "outputFormat":"GML32"}
-            response=None
-            for attempt in range(max_retries):
-                try:
-                    response=session.get(url,params=params,timeout=(20,240),allow_redirects=True)
-                    if response.status_code not in (502,503,504): break
-                except requests.RequestException:
-                    if attempt==max_retries-1: raise
-                time.sleep(2**attempt)
-            if response is None: raise RuntimeError("Aucune reponse du WFS.")
-            if response.status_code in (502,503,504):
-                raise RuntimeError(f"WFS SPF Finances indisponible apres {max_retries} essais (HTTP {response.status_code}). "
-                                   "Reessayez plus tard ou executez l'application localement; le serveur peut filtrer Streamlit Cloud.")
-            if not response.ok:
-                raise RuntimeError(f"Erreur WFS HTTP {response.status_code}\nURL: {response.url}\n{response.text[:1500]}")
-            text=response.text.lstrip().lower()
-            if "exceptionreport" in text or "serviceexception" in text:
-                raise RuntimeError("Erreur retournee par le WFS:\n"+response.text[:2000])
-            try: page=read_response(response.content,response.headers.get("content-type","application/gml+xml"))
-            except Exception as exc: raise RuntimeError("Reponse GML WFS illisible: "+response.text[:800]) from exc
-            if page.empty: break
-            pages.append(page)
-            if len(page)<page_size: break
-            start+=page_size
-            if start>100000: raise RuntimeError("Plus de 100 000 parcelles dans une tuile; reduisez l'emprise.")
-    if not pages: raise RuntimeError("Aucune parcelle renvoyee par le WFS pour cette emprise.")
-    result=gpd.GeoDataFrame(pd.concat(pages,ignore_index=True),crs=pages[0].crs)
-    result=result[result.geometry.notna() & ~result.geometry.is_empty].copy()
-    # Retirer les doublons crees aux limites des tuiles.
-    idcol=find_column(result.columns,["nationalCadastralReference","capakey","parcelKey","localId"])
-    if idcol: result=result.drop_duplicates(subset=[idcol])
-    else: result=result.loc[~result.geometry.to_wkb().duplicated()].copy()
-    return result.to_crs(WORK_CRS)
-
-
-def find_column(columns,candidates):
-    normalized={re.sub(r"[^a-z0-9]","",c.casefold()):c for c in columns}
-    for candidate in candidates:
-        key=re.sub(r"[^a-z0-9]","",candidate.casefold())
-        if key in normalized: return normalized[key]
-    for candidate in candidates:
-        key=re.sub(r"[^a-z0-9]","",candidate.casefold())
-        for norm,original in normalized.items():
-            if key in norm: return original
+def col(columns,names):
+    norm={re.sub('[^a-z0-9]','',c.casefold()):c for c in columns}
+    for n in names:
+        k=re.sub('[^a-z0-9]','',n.casefold())
+        if k in norm:return norm[k]
+    for n in names:
+        k=re.sub('[^a-z0-9]','',n.casefold())
+        for a,b in norm.items():
+            if k in a:return b
     return None
 
-
 def analyze(impact,parcels):
-    joined=gpd.sjoin(parcels,impact[["ELEMENT_KMZ","DOSSIER_KMZ","TYPE_IMPACT","geometry"]],how="inner",predicate="intersects")
-    if joined.empty: return pd.DataFrame()
-    joined["SURFACE_INTERSECTION_M2"]=[geom.intersection(impact.geometry.loc[i]).area for geom,i in zip(joined.geometry,joined.index_right)]
-    cols=joined.columns
-    cap=find_column(cols,["nationalCadastralReference","capakey","parcelKey","localId"])
-    num=find_column(cols,["label","parcelNumber","numeroParcelle","perceelnummer"])
-    com=find_column(cols,["municipality","commune","gemeente","administrativeUnit"])
-    sec=find_column(cols,["section"]); div=find_column(cols,["division","cadastralDivision"])
-    def s(column): return joined[column].astype(str) if column else pd.Series("",index=joined.index)
-    result=pd.DataFrame({"TYPE_IMPACT":joined.TYPE_IMPACT,"ELEMENT_KMZ":joined.ELEMENT_KMZ,
-        "DOSSIER_KMZ":joined.DOSSIER_KMZ,"CAPAKEY":s(cap),"NUMERO_PARCELLE":s(num),
-        "COMMUNE":s(com),"DIVISION":s(div),"SECTION":s(sec),
-        "SURFACE_INTERSECTION_M2":joined.SURFACE_INTERSECTION_M2.round(2)})
-    return result.replace({"nan":"","None":""}).drop_duplicates().sort_values(["TYPE_IMPACT","ELEMENT_KMZ","CAPAKEY"]).reset_index(drop=True)
+    minx,miny,maxx,maxy=impact.total_bounds
+    p=parcels.cx[minx:maxx,miny:maxy].copy()
+    if p.empty:return pd.DataFrame(),0
+    j=gpd.sjoin(p,impact[['ELEMENT_KMZ','DOSSIER_KMZ','TYPE_IMPACT','geometry']],how='inner',predicate='intersects')
+    if j.empty:return pd.DataFrame(),len(p)
+    j['SURFACE_INTERSECTION_M2']=[geom.intersection(impact.geometry.loc[i]).area for geom,i in zip(j.geometry,j.index_right)]
+    cap=col(j.columns,['nationalCadastralReference','capakey','parcelKey','localId'])
+    num=col(j.columns,['label','parcelNumber','numeroParcelle','perceelnummer'])
+    com=col(j.columns,['municipality','commune','gemeente','administrativeUnit'])
+    sec=col(j.columns,['section']);div=col(j.columns,['division','cadastralDivision'])
+    def s(c):return j[c].astype(str) if c else pd.Series('',index=j.index)
+    out=pd.DataFrame({'TYPE_IMPACT':j.TYPE_IMPACT,'ELEMENT_KMZ':j.ELEMENT_KMZ,'DOSSIER_KMZ':j.DOSSIER_KMZ,
+      'CAPAKEY':s(cap),'NUMERO_PARCELLE':s(num),'COMMUNE':s(com),'DIVISION':s(div),'SECTION':s(sec),
+      'SURFACE_INTERSECTION_M2':j.SURFACE_INTERSECTION_M2.round(2)})
+    return out.replace({'nan':'','None':''}).drop_duplicates().sort_values(['TYPE_IMPACT','ELEMENT_KMZ','CAPAKEY']).reset_index(drop=True),len(p)
 
+def excel(out,params):
+    b=io.BytesIO()
+    summary=out.groupby('TYPE_IMPACT',dropna=False).size().reset_index(name='NOMBRE_INTERSECTIONS')
+    with pd.ExcelWriter(b,engine='openpyxl') as w:
+        out.to_excel(w,index=False,sheet_name='Parcelles');summary.to_excel(w,index=False,sheet_name='Synthese')
+        pd.DataFrame(params.items(),columns=['PARAMETRE','VALEUR']).to_excel(w,index=False,sheet_name='Parametres')
+        for sh in w.book.worksheets:
+            sh.freeze_panes='A2';sh.auto_filter.ref=sh.dimensions
+            for c in sh.columns:sh.column_dimensions[c[0].column_letter].width=min(max(len(str(x.value or '')) for x in c)+2,55)
+    return b.getvalue()
 
-def workbook(result,parameters):
-    output=io.BytesIO()
-    summary=result.groupby("TYPE_IMPACT",dropna=False).size().reset_index(name="NOMBRE_INTERSECTIONS")
-    with pd.ExcelWriter(output,engine="openpyxl") as writer:
-        result.to_excel(writer,index=False,sheet_name="Parcelles")
-        summary.to_excel(writer,index=False,sheet_name="Synthese")
-        pd.DataFrame(parameters.items(),columns=["PARAMETRE","VALEUR"]).to_excel(writer,index=False,sheet_name="Parametres")
-        for sheet in writer.book.worksheets:
-            sheet.freeze_panes="A2"; sheet.auto_filter.ref=sheet.dimensions
-            for column in sheet.columns:
-                sheet.column_dimensions[column[0].column_letter].width=min(max(len(str(c.value or "")) for c in column)+2,55)
-    return output.getvalue()
-
-
-def run(uploaded,access_width,overhead_width,point_radius,url,typename,include_other):
-    impact=prepare_impact(read_kmz(uploaded),access_width,overhead_width,point_radius,include_other)
-    parcels=fetch_parcels(impact,url,typename)
-    result=analyze(impact,parcels)
-    params={"WFS":url,"Couche WFS":typename,"CRS calcul":WORK_CRS,"Largeur acces (m)":access_width,
-            "Largeur surplomb (m)":overhead_width,"Rayon points (m)":point_radius,
-            "Objets KMZ retenus":len(impact),"Parcelles WFS chargees":len(parcels)}
-    return result,workbook(result,params)
-
-
-st.set_page_config(page_title="Parcelles permis KMZ",layout="wide")
-st.title("Parcelles cadastrales pour permis de ligne aerienne - V2")
-st.write("V2: requetes WFS en EPSG:3812/GML, decoupage de l emprise et reprises automatiques sur les erreurs 502/503/504.")
-uploaded=st.file_uploader("Fichier KMZ",type=["kmz"])
+st.set_page_config(page_title='Parcelles permis KMZ - Option A',layout='wide')
+st.title('Parcelles cadastrales pour permis - Option A')
+st.caption('Traitement 100 % a partir de fichiers charges: aucun appel WFS.')
+kmz=st.file_uploader('1. Charger le KMZ du projet',type=['kmz'])
+cad=st.file_uploader('2. Charger le parcellaire cadastral',type=['gpkg','gml','geojson','json','zip'])
 c1,c2,c3=st.columns(3)
-access_width=c1.number_input("Largeur totale des acces (m)",0.0,100.0,5.0,0.5)
-overhead_width=c2.number_input("Largeur totale du corridor de surplomb (m)",0.0,200.0,0.0,1.0)
-point_radius=c3.number_input("Rayon autour des points (m)",0.0,100.0,5.0,1.0)
-with st.expander("Parametres avances"):
-    url=st.text_input("URL WFS",WFS_URL)
-    if st.button("Detecter les couches WFS"):
-        try: st.session_state["types"]=feature_types(url); st.success(f"{len(st.session_state['types'])} couche(s) detectee(s).")
-        except Exception as exc: st.error(str(exc))
-    options=st.session_state.get("types",[])
-    typename=st.selectbox("Couche WFS",options,index=0) if options else st.text_input("Couche WFS",DEFAULT_TYPENAME)
-    include_other=st.checkbox("Inclure les objets KMZ non classes",False)
-if st.button("Analyser les parcelles",type="primary",disabled=uploaded is None):
+aw=c1.number_input('Largeur totale des acces (m)',0.0,100.0,5.0,0.5)
+ow=c2.number_input('Largeur totale du corridor de surplomb (m)',0.0,200.0,0.0,1.0)
+pr=c3.number_input('Rayon autour des points (m)',0.0,100.0,5.0,1.0)
+other=st.checkbox('Inclure les objets KMZ non classes',False)
+if st.button('Analyser les parcelles',type='primary',disabled=kmz is None or cad is None):
     try:
-        with st.spinner("Lecture du KMZ, telechargement cadastral et intersections..."):
-            result,xlsx=run(uploaded,access_width,overhead_width,point_radius,url,typename,include_other)
-        if result.empty: st.warning("Aucune intersection trouvee.")
+        with st.spinner('Lecture des fichiers et calcul des intersections...'):
+            impact=prepare(read_kmz(kmz),aw,ow,pr,other);parcels=read_cadastre(cad);result,nlocal=analyze(impact,parcels)
+        if result.empty:st.warning('Aucune intersection trouvee dans la zone du projet.')
         else:
-            distinct=result.CAPAKEY[result.CAPAKEY!=""].nunique()
-            st.success(f"{len(result)} intersections trouvees; {distinct} CAPAKEY distinctes.")
+            distinct=result.CAPAKEY[result.CAPAKEY!=''].nunique()
+            st.success(f'{len(result)} intersections; {distinct} CAPAKEY distinctes; {nlocal} parcelles chargees dans l emprise.')
             st.dataframe(result,use_container_width=True,hide_index=True)
-            st.download_button("Telecharger Parcelles_permis.xlsx",xlsx,"Parcelles_permis.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception as exc: st.exception(exc)
+            data=excel(result,{'CRS calcul':WORK_CRS,'Fichier KMZ':kmz.name,'Fichier cadastral':cad.name,'Largeur acces (m)':aw,'Largeur surplomb (m)':ow,'Rayon points (m)':pr})
+            st.download_button('Telecharger Parcelles_permis.xlsx',data,'Parcelles_permis.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    except Exception as e:st.exception(e)
