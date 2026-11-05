@@ -78,7 +78,7 @@ def prepare(raw,access_width,overhead_width,point_radius,include_other):
     g.geometry=new
     return g[~g.geometry.is_empty].copy()
 
-def read_cadastre(upload):
+def read_cadastre_one(upload):
     name=upload.name.lower(); raw=upload.getvalue()
     with tempfile.TemporaryDirectory() as td:
         root=Path(td)
@@ -96,6 +96,24 @@ def read_cadastre(upload):
     if g.crs is None:raise ValueError('Le fichier cadastral ne contient pas de CRS/projection.')
     g=g[g.geometry.notna() & ~g.geometry.is_empty].copy()
     return g.to_crs(WORK_CRS)
+
+def read_cadastres(uploads):
+    if not uploads:
+        raise ValueError('Aucun fichier cadastral charge.')
+    frames=[]
+    for upload in uploads:
+        g=read_cadastre_one(upload).copy()
+        g['SOURCE_GML']=upload.name
+        frames.append(g)
+    merged=gpd.GeoDataFrame(pd.concat(frames,ignore_index=True),crs=WORK_CRS)
+    merged=merged[merged.geometry.notna() & ~merged.geometry.is_empty].copy()
+    # Retire les doublons eventuels aux limites entre communes/fichiers.
+    key=col(merged.columns,['nationalCadastralReference','capakey','parcelKey','localId'])
+    if key:
+        merged=merged.drop_duplicates(subset=[key],keep='first')
+    else:
+        merged=merged.loc[~merged.geometry.to_wkb().duplicated()].copy()
+    return merged
 
 def col(columns,names):
     norm={re.sub('[^a-z0-9]','',c.casefold()):c for c in columns}
@@ -140,21 +158,21 @@ st.set_page_config(page_title='Parcelles permis KMZ - Option A',layout='wide')
 st.title('Parcelles cadastrales pour permis - Option A')
 st.caption('Traitement 100 % a partir de fichiers charges: aucun appel WFS.')
 kmz=st.file_uploader('1. Charger le KMZ du projet',type=['kmz'])
-cad=st.file_uploader('2. Charger le parcellaire cadastral',type=['gpkg','gml','geojson','json','zip'])
+cad=st.file_uploader('2. Charger un ou plusieurs fichiers cadastraux',type=['gpkg','gml','geojson','json','zip'],accept_multiple_files=True,help='Exemple : Bertrix.gml + Neufchateau.gml. Les couches sont fusionnees automatiquement.')
 c1,c2,c3=st.columns(3)
 aw=c1.number_input('Largeur totale des acces (m)',0.0,100.0,5.0,0.5)
 ow=c2.number_input('Largeur totale du corridor de surplomb (m)',0.0,200.0,0.0,1.0)
 pr=c3.number_input('Rayon autour des points (m)',0.0,100.0,5.0,1.0)
 other=st.checkbox('Inclure les objets KMZ non classes',False)
-if st.button('Analyser les parcelles',type='primary',disabled=kmz is None or cad is None):
+if st.button('Analyser les parcelles',type='primary',disabled=kmz is None or not cad):
     try:
         with st.spinner('Lecture des fichiers et calcul des intersections...'):
-            impact=prepare(read_kmz(kmz),aw,ow,pr,other);parcels=read_cadastre(cad);result,nlocal=analyze(impact,parcels)
+            impact=prepare(read_kmz(kmz),aw,ow,pr,other);parcels=read_cadastres(cad);result,nlocal=analyze(impact,parcels)
         if result.empty:st.warning('Aucune intersection trouvee dans la zone du projet.')
         else:
             distinct=result.CAPAKEY[result.CAPAKEY!=''].nunique()
             st.success(f'{len(result)} intersections; {distinct} CAPAKEY distinctes; {nlocal} parcelles chargees dans l emprise.')
             st.dataframe(result,use_container_width=True,hide_index=True)
-            data=excel(result,{'CRS calcul':WORK_CRS,'Fichier KMZ':kmz.name,'Fichier cadastral':cad.name,'Largeur acces (m)':aw,'Largeur surplomb (m)':ow,'Rayon points (m)':pr})
+            data=excel(result,{'CRS calcul':WORK_CRS,'Fichier KMZ':kmz.name,'Fichiers cadastraux':', '.join(x.name for x in cad),'Largeur acces (m)':aw,'Largeur surplomb (m)':ow,'Rayon points (m)':pr})
             st.download_button('Telecharger Parcelles_permis.xlsx',data,'Parcelles_permis.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     except Exception as e:st.exception(e)
